@@ -1081,7 +1081,7 @@ app.get("/canvas", async (req, res) => {
 
     console.log(`✅ Loaded ${Object.keys(templates).length} templates, ${Object.keys(users).length} users and ${loadedProxies.length} proxies.`);
 
-    const port = Number(process.env.PORT) || 80;
+    const port = Number(process.env.PORT) || 3000;
     const host = "0.0.0.0";
     app.listen(port, host, (error) => {
         console.log(`✅ Server listening on http://localhost:${port}`);
