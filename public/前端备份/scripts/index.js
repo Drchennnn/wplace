@@ -33,75 +33,6 @@ const px = $("px");
 const py = $("py");
 const userSelectList = $("userSelectList");
 const selectAllUsers = $("selectAllUsers");
-
-// === Enhanced user multi-select ===
-let __allUsersCache = [];
-let __lastCheckedIndex = null;
-
-function __renderUserList(list) {
-    const container = document.getElementById('userSelectList');
-    container.innerHTML = '';
-    list.forEach((u, idx) => {
-        const row = document.createElement('div');
-        row.className = 'user-select-item';
-
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.id = `user_${u.id}`;
-        cb.name = 'user_checkbox';
-        cb.value = u.id;
-        cb.dataset.index = String(idx);
-
-        cb.addEventListener('click', (e) => {
-            if (!e.shiftKey || __lastCheckedIndex === null) {
-                __lastCheckedIndex = idx;
-                return;
-            }
-            const start = Math.min(__lastCheckedIndex, idx);
-            const end = Math.max(__lastCheckedIndex, idx);
-            const cbs = container.querySelectorAll('input[type="checkbox"]');
-            for (let i=start;i<=end;i++) {
-                cbs[i].checked = cb.checked;
-            }
-            __lastCheckedIndex = idx;
-        });
-
-        const label = document.createElement('label');
-        label.htmlFor = `user_${u.id}`;
-        label.textContent = `${u.name} (#${u.id})`;
-
-        row.appendChild(cb);
-        row.appendChild(label);
-        container.appendChild(row);
-    });
-}
-
-function __bindUserToolbar() {
-    const filter = document.getElementById('userFilter');
-    const btnAll = document.getElementById('btnAll');
-    const btnNone = document.getElementById('btnNone');
-    const btnInvert = document.getElementById('btnInvert');
-
-    if (btnAll) btnAll.onclick = () => {
-        document.querySelectorAll('#userSelectList input[type="checkbox"]').forEach(cb => cb.checked = true);
-    };
-    if (btnNone) btnNone.onclick = () => {
-        document.querySelectorAll('#userSelectList input[type="checkbox"]').forEach(cb => cb.checked = false);
-    };
-    if (btnInvert) btnInvert.onclick = () => {
-        document.querySelectorAll('#userSelectList input[type="checkbox"]').forEach(cb => cb.checked = !cb.checked);
-    };
-    if (filter) filter.oninput = (e) => {
-        const q = (e.target.value || '').toLowerCase();
-        const filtered = __allUsersCache.filter(u =>
-            (u.name||'').toLowerCase().includes(q) ||
-            String(u.id).toLowerCase().includes(q) ||
-            (u.email||'').toLowerCase().includes(q)
-        );
-        __renderUserList(filtered);
-    };
-}
-
 const canBuyMaxCharges = $("canBuyMaxCharges");
 const canBuyCharges = $("canBuyCharges");
 const antiGriefMode = $("antiGriefMode");
@@ -720,19 +651,26 @@ openAddTemplate.addEventListener("click", () => {
             userSelectList.innerHTML = "<span>No users added. Please add a user first.</span>";
             return;
         }
-        
-__allUsersCache = Object.keys(users).map(id => ({
-    id,
-    name: users[id].name || 'Unknown',
-    email: users[id].email || ''
-}));
-__renderUserList(__allUsersCache);
-__bindUserToolbar();
-});
+        for (const id of Object.keys(users)) {
+            const userDiv = document.createElement('div');
+            userDiv.className = 'user-select-item';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.id = `user_${id}`;
+            checkbox.name = 'user_checkbox';
+            checkbox.value = id;
+            const label = document.createElement('label');
+            label.htmlFor = `user_${id}`;
+            label.textContent = `${users[id].name} (#${id})`;
+            userDiv.appendChild(checkbox);
+            userDiv.appendChild(label);
+            userSelectList.appendChild(userDiv);
+        }
+    });
     changeTab(addTemplate);
 });
 selectAllUsers.addEventListener('click', () => {
-    const btn = document.getElementById('btnAll'); if (btn) btn.click();
+    document.querySelectorAll('#userSelectList input[type="checkbox"]').forEach(cb => cb.checked = true);
 });
 
 const createToggleButton = (template, id, buttonsContainer, progressBarText, currentPercent) => {

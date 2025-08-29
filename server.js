@@ -43,12 +43,15 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // --- WPlacer Core Classes and Constants ---
 class SuspensionError extends Error {
     constructor(message, durationMs) {
-        super(message);
-        this.name = "SuspensionError";
-        this.durationMs = durationMs;
-        this.suspendedUntil = Date.now() + durationMs;
+      super(message);
+      this.name = "SuspensionError";
+     const MIN = 10 * 60 * 1000;            // 10 分钟兜底
+     const safeDur = Math.max(Number(durationMs) || 0, MIN);
+     this.durationMs = safeDur;
+    this.suspendedUntil = Date.now() + safeDur;
     }
-}
+  }
+ 
 
 // Custom error for network/Cloudflare issues
 class NetworkError extends Error {
@@ -170,29 +173,63 @@ class WPlacer {
     }
 
     async loadUserInfo() {
-        const me = await this.browser.fetch("https://backend.wplace.live/me");
-        const bodyText = await me.text();
-
-        if (bodyText.trim().startsWith("<!DOCTYPE html>")) {
-            throw new NetworkError("Cloudflare interruption detected. The server may be down or rate limiting.");
-        }
-
-        try {
-            const userInfo = JSON.parse(bodyText);
-            if (userInfo.error === "Unauthorized") throw new NetworkError(`(401) Unauthorized. This is likely a rate-limit.`);
-            if (userInfo.error) throw new Error(`(500) Failed to authenticate: "${userInfo.error}". The cookie is likely invalid or expired.`);
-            if (userInfo.id && userInfo.name) {
-                this.userInfo = userInfo;
-                return true;
+        const url = "https://backend.wplace.live/me";
+        const MAX_RETRIES = 4;
+        let backoff = 800; // ms
+      
+        for (let i = 0; i <= MAX_RETRIES; i++) {
+          try {
+            const resp = await this.browser.fetch(url, {
+              headers: { 'Accept': 'application/json,*/*' }
+            });
+      
+            const text = await resp.text();
+      
+            // Cloudflare 人机/拦截页（HTML），按网络错误处理，进入重试
+            if (text.trim().startsWith("<!DOCTYPE html>")) {
+              throw new NetworkError("Cloudflare interruption detected.");
             }
-            throw new Error(`Unexpected response from /me endpoint: ${JSON.stringify(userInfo)}`);
-        } catch (e) {
-            if (e instanceof NetworkError) throw e; // Re-throw our custom error
-            if (bodyText.includes('Error 1015')) throw new NetworkError("(1015) You are being rate-limited by the server.");
-            if (bodyText.includes('502') && bodyText.includes('gateway')) throw new NetworkError(`(502) Bad Gateway: The server is temporarily unavailable.`);
-            throw new Error(`Failed to parse server response. Response: "${bodyText.substring(0, 150)}..."`);
+      
+            // 尝试解析 JSON；失败就保留原文，继续按状态码分流
+            let data;
+            try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+      
+            // 成功路径
+            if (resp.ok && data?.id && data?.name) {
+              this.userInfo = data;
+              return true;
+            }
+      
+            // 明确的鉴权/风控
+            if (resp.status === 401 || data?.error === "Unauthorized")
+              throw new NetworkError("(401) Unauthorized / rate-limited.");
+            if (resp.status === 403)
+              throw new NetworkError("(403) Forbidden / challenge.");
+      
+            // 服务端 5xx 一律按可重试的网络错误处理
+            if (resp.status >= 500)
+              throw new NetworkError(`(${resp.status}) Upstream error.`);
+      
+            // 其他异常响应：抛出简短说明（不要“解析失败”这种误导信息）
+            throw new Error(`Unexpected /me response: ${text.slice(0,200)}`);
+      
+          } catch (e) {
+            // Impit 自身的超时/握手异常也按可重试
+            const retryable =
+              e.name === 'NetworkError' ||
+              /timeout|ECONNRESET|eof|handshake/i.test(String(e.message));
+      
+            if (retryable && i < MAX_RETRIES) {
+              await sleep(backoff + Math.random()*300);
+              backoff = Math.min(backoff * 2, 5000);
+              continue;
+            }
+            // 非可重试错误，原样抛出
+            throw e;
+          }
         }
-    };
+      }
+      
 
     async post(url, body) {
         const request = await this.browser.fetch(url, {
@@ -281,9 +318,12 @@ class WPlacer {
         if (response.status === 403 && (response.data.error === "refresh" || response.data.error === "Unauthorized")) {
             throw new Error('REFRESH_TOKEN');
         }
-        if (response.status === 451 && response.data.suspension) {
-            throw new SuspensionError(`Account is suspended.`, response.data.durationMs || 0);
-        }
+        if (response.status === 451 && response.data) {
+            const s = response.data.suspension || {};
+            let dur = Number(response.data.durationMs ?? s.durationMs);
+            if (!(dur > 0) && s.until) dur = Math.max(0, Number(s.until) - Date.now());
+            throw new SuspensionError(`Account is suspended.`, dur || 0);
+            }
         if (response.status === 500) {
             log(this.userInfo.id, this.userInfo.name, `[${this.templateName}] ⏱️ Server error (500). Waiting 40 seconds before retrying...`);
             await sleep(40000);
@@ -483,7 +523,8 @@ let currentSettings = {
     pixelSkip: 1,
     proxyEnabled: false,
     proxyRotationMode: 'sequential',
-    logProxyUsage: false
+    logProxyUsage: false,
+    banCooldownMinutes: 2
 };
 if (existsSync(path.join(dataDir, "settings.json"))) {
     currentSettings = { ...currentSettings, ...loadJSON("settings.json") };
@@ -520,8 +561,9 @@ const TokenManager = {
         this._purgeExpiredTokens();
 
         if (this.tokenQueue.length > 0) {
-            return Promise.resolve(this.tokenQueue[0].token);
-        }
+               const item = this.tokenQueue.shift();    // ← 取出即删，避免多账号复用同一 token
+               return Promise.resolve(item.token);
+             }
 
         if (!this.tokenPromise) {
             log('SYSTEM', 'wplacer', 'TOKEN_MANAGER: A task is waiting for a token. Flagging for clients.');
@@ -537,7 +579,7 @@ const TokenManager = {
         log('SYSTEM', 'wplacer', `✅ TOKEN_MANAGER: Token received. Queue size: ${this.tokenQueue.length + 1}`);
         this.isTokenNeeded = false;
         const newToken = { token: t, receivedAt: Date.now() };
-        this.tokenQueue.push(newToken);
+        this.tokenQueue = [newToken];
 
         if (this.resolvePromise) {
             this.resolvePromise(newToken.token); // Resolve with the new token
@@ -586,6 +628,7 @@ class TemplateManager {
         this.initialRetryDelay = 30 * 1000; // 30 seconds
         this.maxRetryDelay = 5 * 60 * 1000; // 5 minutes
         this.currentRetryDelay = this.initialRetryDelay;
+        this.recentlySuspended = new Map(); // id -> ts
     }
 
     sleep(ms) {
@@ -642,16 +685,23 @@ class TemplateManager {
                 paintingComplete = true;
             } catch (error) {
                 if (error.name === "SuspensionError") {
-                    const suspendedUntilDate = new Date(error.suspendedUntil).toLocaleString();
-                    log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🛑 Account suspended from painting until ${suspendedUntilDate}.`);
-                    users[wplacer.userInfo.id].suspendedUntil = error.suspendedUntil;
+                    const suspMs = Number(error.suspendedUntil) || (Date.now() + 10*60*1000);
+                    const coolExtra = Math.max(0, Number(currentSettings.banCooldownMinutes) || 0) * 60 * 1000;
+                    const blockedUntil = suspMs + coolExtra;
+                    const suspStr = new Date(suspMs).toLocaleString();
+                    const coolStr = coolExtra ? ` (+ cooldown ${Math.round(coolExtra/60000)}m)` : '';
+                    log(wplacer.userInfo.id, wplacer.userInfo.name,
+                        `[${this.name}] 🛑 Account suspended until ${suspStr}${coolStr}.`);
+                    users[wplacer.userInfo.id].suspendedUntil = blockedUntil;
                     saveUsers();
-                    throw error; // RE-THROW THE ERROR to be caught by the main loop
-                }
+                    this.recentlySuspended.set(wplacer.userInfo.id, blockedUntil);
+                    throw error; // 交给外层循环处理
+                    }
+                
                 if (error.message === 'REFRESH_TOKEN') {
                     log(wplacer.userInfo.id, wplacer.userInfo.name, `[${this.name}] 🔄 Token expired or invalid. Trying next token...`);
                     TokenManager.invalidateToken();
-                    await this.sleep(1000);
+                    await this.sleep(1200 + Math.floor(Math.random() * 800));
                 } else {
                     // Re-throw other errors to be handled by the main loop
                     throw error;
@@ -772,24 +822,37 @@ class TemplateManager {
                         }
 
                         const localUserStates = [];
-                        const availableUsers = this.userIds.filter(id => !(users[id].suspendedUntil && Date.now() < users[id].suspendedUntil) && !activeBrowserUsers.has(id));
-
-                        log('SYSTEM', 'wplacer', `[${this.name}] Checking status for ${availableUsers.length} available users...`);
+                        const now = Date.now();
+                        
+                        // 统一按“封禁到期 + 冷静期”跳过（包含持久化的 suspendedUntil 与进程内 recentlySuspended）
+                        const availableUsers = this.userIds.filter(id => {
+                          const u = users[id] || {};
+                          const persisted = Number(u.suspendedUntil) || 0;              // 持久化记录（我们在捕获 SuspensionError 时写入，含冷静期）
+                          const recent    = Number(this.recentlySuspended.get(id)) || 0; // 进程内最近一次记录（防止未持久化也能生效）
+                          const blockedUntil = Math.max(persisted, recent);
+                          const blocked = blockedUntil && now < blockedUntil;
+                          return !blocked && !activeBrowserUsers.has(id);
+                        });
+                        
+                        // 日志里把被跳过的数量也打出来，便于观测是否生效
+                        const skippedCount = this.userIds.length - availableUsers.length;
+                        log('SYSTEM', 'wplacer', `[${this.name}] Checking status for ${availableUsers.length} available users (skipped ${skippedCount} blocked users)...`);
+                        
                         for (const userId of availableUsers) {
-                            if (activeBrowserUsers.has(userId)) continue;
-                            activeBrowserUsers.add(userId);
-                            const wplacer = new WPlacer();
-                            try {
-                                const userInfo = await wplacer.login(users[userId].cookies);
-                                localUserStates.push({ userId, charges: userInfo.charges });
-                            } catch (error) {
-                                logUserError(error, userId, users[userId].name, "check user status");
-                            } finally {
-                                activeBrowserUsers.delete(userId);
-                            }
-                            await this.sleep(currentSettings.accountCheckCooldown);
+                          if (activeBrowserUsers.has(userId)) continue;
+                          activeBrowserUsers.add(userId);
+                          const wplacer = new WPlacer();
+                          try {
+                            const userInfo = await wplacer.login(users[userId].cookies);
+                            localUserStates.push({ userId, charges: userInfo.charges });
+                          } catch (error) {
+                            logUserError(error, userId, users[userId].name, "check user status");
+                          } finally {
+                            activeBrowserUsers.delete(userId);
+                          }
+                          await this.sleep(currentSettings.accountCheckCooldown);
                         }
-
+                        
                         const readyUsers = localUserStates
                             .filter(state => Math.floor(state.charges.count) >= Math.max(1, Math.floor(state.charges.max * currentSettings.chargeThreshold)))
                             .sort((a, b) => b.charges.count - a.charges.count);
