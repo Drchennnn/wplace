@@ -5,6 +5,7 @@ import cors from "cors";
 import { CookieJar } from "tough-cookie";
 import { Impit } from "impit";
 import { createCanvas, loadImage } from "canvas";
+import { router as sseRouter, sendToAll } from "./sse.js";
 
 // --- Setup Data Directory ---
 const dataDir = "./data";
@@ -40,6 +41,50 @@ const duration = (durationMs) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// === JWT 过期时间解析 ===
+function readJwtExp(jwt) {
+    if (!jwt || typeof jwt !== 'string' || !jwt.includes('.')) return null;
+    try {
+      const payloadB64 = jwt.split('.')[1];
+      const json = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+      return Number(json.exp) || null; // 秒级时间戳
+    } catch { return null; }
+  }
+  function getCookieJwt(user) {
+    return user?.cookies?.j || null;
+  }
+  
+  // --- Express App Setup ---
+  // --- Express App Setup ---
+const app = express();
+app.use(cors());
+app.use(express.static("public"));
+app.use(express.json({ limit: Infinity }));
+
+
+  // === SSE 路由 & 广播 ===
+  app.use("/api", sseRouter);
+  
+  function broadcastUserUpdate(userInfo, extra = {}) {
+    if (!userInfo || !userInfo.id) return;
+    const persisted = users[userInfo.id] || {};
+    const jwt = getCookieJwt(persisted);
+    const expSec = readJwtExp(jwt);
+    const jwtExpMs = expSec ? expSec * 1000 : null;
+  
+    sendToAll("user_update", {
+      userId: userInfo.id,
+      username: userInfo.name,
+      charges: Number.isFinite(userInfo?.charges?.count) ? userInfo.charges.count : null,
+      maxCharges: Number.isFinite(userInfo?.charges?.max) ? userInfo.charges.max : null,
+      level: userInfo?.level ?? null,
+      droplets: userInfo?.droplets ?? null,
+      recentlySuspended: !!extra.recentlySuspended,
+      suspendedUntil: persisted?.suspendedUntil ?? null,
+      jwtExp: jwtExpMs,
+      ts: Date.now(),
+    });
+  }
 // --- WPlacer Core Classes and Constants ---
 class SuspensionError extends Error {
     constructor(message, durationMs) {
@@ -509,6 +554,7 @@ const saveTemplates = () => {
         templatesToSave[id] = {
             name: t.name, template: t.template, coords: t.coords,
             canBuyCharges: t.canBuyCharges, canBuyMaxCharges: t.canBuyMaxCharges,
+            purchaseMode: t.purchaseMode,
             antiGriefMode: t.antiGriefMode, enableAutostart: t.enableAutostart, userIds: t.userIds
         };
     }
@@ -532,10 +578,6 @@ if (existsSync(path.join(dataDir, "settings.json"))) {
 const saveSettings = () => {
     saveJSON("settings.json", currentSettings);
 };
-
-// --- Server State ---
-const activeBrowserUsers = new Set();
-let activePaintingTasks = 0;
 
 // --- Token Management ---
 const TokenManager = {
@@ -603,6 +645,9 @@ function logUserError(error, id, name, context) {
         log(id, name, `❌ Failed to ${context}`, error);
     }
 }
+// --- Server State ---  
+const activeBrowserUsers = new Set();
+let activePaintingTasks = 0;
 
 // --- Template Management ---
 class TemplateManager {
@@ -629,6 +674,19 @@ class TemplateManager {
         this.maxRetryDelay = 5 * 60 * 1000; // 5 minutes
         this.currentRetryDelay = this.initialRetryDelay;
         this.recentlySuspended = new Map(); // id -> ts
+
+        // 统一“买电模式”：'none' | 'normal' | 'max'
+        // 兼容：前端可能只发老字段 canBuyCharges / canBuyMaxCharges
+        this.purchaseMode = (typeof this.purchaseMode === 'string') ? this.purchaseMode
+        : (this.canBuyMaxCharges ? 'max' : (this.canBuyCharges ? 'normal' : 'none'));
+
+        // 向下兼容：老代码里大量用到这俩布尔
+        this.canBuyCharges    = (this.purchaseMode === 'normal' || this.purchaseMode === 'max');
+        this.canBuyMaxCharges = (this.purchaseMode === 'max');
+
+        // 可选：启动时打一条日志自检
+        log('SYSTEM', 'wplacer', `[${this.name}] PurchaseMode=${this.purchaseMode} canBuyCharges=${this.canBuyCharges} canBuyMaxCharges=${this.canBuyMaxCharges}`);
+
     }
 
     sleep(ms) {
@@ -676,6 +734,57 @@ class TemplateManager {
         }
     }
 
+    async _maybeBuyChargesAfterTurn(preferredBuyerId) {
+        if (!this.canBuyCharges) return false;
+        if (this.pixelsRemaining <= 0) return false;
+      
+        // 用 master 统一购买，避免并发
+        const candidates = [preferredBuyerId, this.masterId].filter(Boolean);
+        let buyerId = null, buyerInfo = null, buyer = null;
+      
+        try {
+            for (const uid of candidates) {
+                  if (!uid || activeBrowserUsers.has(uid)) continue;
+                  activeBrowserUsers.add(uid);
+                  const w = new WPlacer(this.template, this.coords, currentSettings, this.name);
+                  try {
+                    const info = await w.login(users[uid].cookies);
+                    buyerId = uid; buyerInfo = info; buyer = w; break;
+                    } catch {
+                    activeBrowserUsers.delete(uid);
+                  }
+                }
+                if (!buyer) { log('SYSTEM','wplacer',`[${this.name}] 🔸 Skip buy: no free buyer (current/master busy).`); return false; }
+                if (buyerInfo) broadcastUserUpdate(buyerInfo);
+      
+                const affordableDroplets = Math.max(0, (buyerInfo.droplets || 0) - currentSettings.dropletReserve);
+                if (affordableDroplets < 500) { 
+                   log(buyerId, users[buyerId].name, `[${this.name}] 🔸 Skip buy: droplets ${buyerInfo.droplets} < reserve+500.`);
+                   return false; 
+                }
+      
+          const amountToBuy = Math.min(
+            Math.ceil(this.pixelsRemaining / 30),
+            Math.floor(affordableDroplets / 500)
+          );
+          if (amountToBuy <= 0) { 
+              log(buyerId, users[buyerId].name, `[${this.name}] 🔸 Skip buy: amountToBuy=0 (need/money不足).`);
+              return false; 
+            }
+      
+          log(buyerId, users[buyerId].name, `[${this.name}] 💰 Attempting to buy pixel charges. packs=${amountToBuy}`);
+          await buyer.buyProduct(80, amountToBuy); // 30px/500滴
+          await this.sleep(currentSettings.purchaseCooldown);
+          return true;
+        } catch (e) {
+          logUserError(e, buyerId || this.masterId, users[buyerId || this.masterId]?.name || this.masterName, "attempt to buy pixel charges");
+          return false;
+        } finally {
+          if (buyerId) activeBrowserUsers.delete(buyerId);
+        }
+      }
+      
+
     async _performPaintTurn(wplacer) {
         let paintingComplete = false;
         while (!paintingComplete && this.running) {
@@ -711,7 +820,7 @@ class TemplateManager {
     }
 
     async runUser(userToRun){
-        if (userToRun in activeBrowserUsers) return;
+        if (activeBrowserUsers.has(userToRun.userId)) return;
         if (userToRun) {
             activeBrowserUsers.add(userToRun.userId);
             const wplacer = new WPlacer(this.template, this.coords, currentSettings, this.name);
@@ -741,6 +850,11 @@ class TemplateManager {
                 activeBrowserUsers.delete(userToRun.userId);
             }
 
+               // ★ 这里调用：落笔后购买（内部自带各种判定和并发保护）
+            if (paintedInTurn && this.running) {
+                await this._maybeBuyChargesAfterTurn(userToRun.userId);
+            }
+              
             if (paintedInTurn && this.running && this.userIds.length > 1) {
                 log('SYSTEM', 'wplacer', `[${this.name}] ⏱️ Waiting for account turn cooldown (${duration(currentSettings.accountCooldown)}).`);
                 await this.sleep(currentSettings.accountCooldown);
@@ -798,7 +912,8 @@ class TemplateManager {
                         for (const userId of availableCheckUsers) {
                             const checkWplacer = new WPlacer(this.template, this.coords, currentSettings, this.name);
                             try {
-                                await checkWplacer.login(users[userId].cookies);
+                                const userInfo = await checkWplacer.login(users[userId].cookies);
+                                if (userInfo) broadcastUserUpdate(userInfo);
                                 this.pixelsRemaining = await checkWplacer.pixelsLeft(this.currentPixelSkip);
                                 this.currentRetryDelay = this.initialRetryDelay;
                                 pixelsChecked = true;
@@ -844,6 +959,7 @@ class TemplateManager {
                           const wplacer = new WPlacer();
                           try {
                             const userInfo = await wplacer.login(users[userId].cookies);
+                            broadcastUserUpdate(userInfo);
                             localUserStates.push({ userId, charges: userInfo.charges });
                           } catch (error) {
                             logUserError(error, userId, users[userId].name, "check user status");
@@ -896,11 +1012,6 @@ class TemplateManager {
     }
 }
 
-// --- Express App Setup ---
-const app = express();
-app.use(cors());
-app.use(express.static("public"));
-app.use(express.json({ limit: Infinity }));
 
 // --- Autostartup Templates Array ---
 const autostartedTemplates = [];
@@ -924,6 +1035,7 @@ app.post("/user", async (req, res) => {
     try {
         const userInfo = await wplacer.login(req.body.cookies);
         users[userInfo.id] = { name: userInfo.name, cookies: req.body.cookies, expirationDate: req.body.expirationDate };
+        broadcastUserUpdate(userInfo);
         saveUsers();
         res.json(userInfo);
     } catch (error) {
@@ -971,6 +1083,7 @@ app.get("/user/status/:id", async (req, res) => {
     const wplacer = new WPlacer();
     try {
         const userInfo = await wplacer.login(users[id].cookies);
+        broadcastUserUpdate(userInfo);
         res.status(200).json(userInfo);
     } catch (error) {
         logUserError(error, id, users[id].name, "validate cookie");
@@ -980,6 +1093,60 @@ app.get("/user/status/:id", async (req, res) => {
     }
 });
 
+// 单账号：替换 cookies 并校验
+app.post("/user/:id/cookies", async (req, res) => {
+    const { id } = req.params;
+    const { cookies, expirationDate } = req.body || {};
+    if (!users[id] || !cookies?.j) return res.sendStatus(400);
+  
+    const w = new WPlacer();
+    try {
+      const info = await w.login(cookies);         // 用新 cookie 校验
+      users[id].cookies = cookies;                 // 保存
+      users[id].expirationDate = expirationDate || null;
+      const expSec = readJwtExp(cookies.j);
+      users[id].jwtExp = expSec ? expSec * 1000 : null;
+      saveUsers();
+  
+      broadcastUserUpdate(info);                   // SSE 刷新卡片
+      res.json({ ok: true, id, name: info.name });
+    } catch (e) {
+      logUserError(e, id, users[id].name, "replace cookies");
+      res.status(400).json({ ok:false, error: e.message });
+    }
+  });
+  
+  // 批量：数组或 JSONL
+  app.post("/users/cookies-bulk", async (req, res) => {
+    let list = [];
+    if (Array.isArray(req.body?.list)) list = req.body.list;
+    else if (typeof req.body === 'string') {
+      list = req.body.split('\n').map(s=>s.trim()).filter(Boolean).map(JSON.parse);
+    } else return res.sendStatus(400);
+  
+    const results = [];
+    for (const item of list) {
+      const { id, cookies, expirationDate } = item || {};
+      if (!id || !users[id] || !cookies?.j) { results.push({ id, ok:false, error:'bad_entry' }); continue; }
+      const w = new WPlacer();
+      try {
+        const info = await w.login(cookies);
+        users[id].cookies = cookies;
+        users[id].expirationDate = expirationDate || null;
+        const expSec = readJwtExp(cookies.j);
+        users[id].jwtExp = expSec ? expSec * 1000 : null;
+        saveUsers();
+        broadcastUserUpdate(info);
+        results.push({ id, ok:true, name: info.name });
+        await sleep(300);
+      } catch (e) {
+        logUserError(e, id, users[id].name, "bulk replace cookies");
+        results.push({ id, ok:false, error: e.message });
+      }
+    }
+    res.json({ results });
+  });
+  
 app.post("/users/status", async (req, res) => {
     const userIds = Object.keys(users);
     const results = {};
@@ -994,6 +1161,7 @@ app.post("/users/status", async (req, res) => {
         const wplacer = new WPlacer();
         try {
             const userInfo = await wplacer.login(users[id].cookies);
+            broadcastUserUpdate(userInfo);
             results[id] = { success: true, data: userInfo };
         } catch (error) {
             logUserError(error, id, users[id].name, "validate cookie in bulk check");
@@ -1016,7 +1184,52 @@ app.post("/users/status", async (req, res) => {
     await Promise.all(workers);
     res.json(results);
 });
+// 设置单个用户的分组
+app.put("/user/:id/group", (req, res) => {
+    const { id } = req.params;
+    const { group } = req.body || {};
+    if (!users[id]) return res.sendStatus(404);
+    users[id].group = group || null;
+    saveUsers();
+    res.json({ ok: true, id, group: users[id].group });
+  });
+  
+  // 批量给一组用户设分组
+  app.post("/users/group-bulk", (req, res) => {
+    const { ids, group } = req.body || {};
+    if (!Array.isArray(ids) || ids.length === 0) return res.sendStatus(400);
+    const results = [];
+    for (const id of ids) {
+      if (!users[id]) { results.push({ id, ok:false, error:'not_found' }); continue; }
+      users[id].group = group || null;
+      results.push({ id, ok:true });
+    }
+    saveUsers();
+    res.json({ ok:true, results });
+  });
+  
+  // 列出已有分组（下拉菜单用）
+  app.get("/users/groups", (_, res) => {
+    const set = new Set();
+    for (const id of Object.keys(users)) {
+      if (users[id]?.group) set.add(users[id].group);
+    }
+    res.json({ groups: Array.from(set).sort() });
+  });
+  
+  app.post("/api/bulkSyncGroup", async (req, res) => {
+    const { groupId, userIds = [] } = req.body || {};
+    if (!groupId || userIds.length === 0) {
+      return res.status(400).json({ error: "参数不全" });
+    }
+  
+    // TODO: 在这里写你的实际同步逻辑
+    console.log("分组同步请求:", groupId, userIds);
+  
+    return res.json({ groupId, count: userIds.length });
+  });
 
+  
 app.get("/templates", (_, res) => {
     const sanitizedTemplates = {};
     for (const id in templates) {
@@ -1027,6 +1240,7 @@ app.get("/templates", (_, res) => {
             coords: t.coords,
             canBuyCharges: t.canBuyCharges,
             canBuyMaxCharges: t.canBuyMaxCharges,
+            purchaseMode: t.purchaseMode,
             antiGriefMode: t.antiGriefMode,
             enableAutostart: t.enableAutostart,
             userIds: t.userIds,
@@ -1040,7 +1254,10 @@ app.get("/templates", (_, res) => {
 });
 
 app.post("/template", async (req, res) => {
-    const { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart } = req.body;
+    let { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, purchaseMode } = req.body;
+    const mode = purchaseMode || (canBuyMaxCharges ? 'max' : (canBuyCharges ? 'normal' : 'none'));
+    canBuyCharges    = (mode === 'normal' || mode === 'max');
+    canBuyMaxCharges = (mode === 'max');
     if (!templateName || !template || !coords || !userIds || !userIds.length) return res.sendStatus(400);
     if (Object.values(templates).some(t => t.name === templateName)) {
         return res.status(409).json({ error: "A template with this name already exists." });
@@ -1063,7 +1280,10 @@ app.put("/template/edit/:id", async (req, res) => {
     const { id } = req.params;
     if (!templates[id]) return res.sendStatus(404);
     const manager = templates[id];
-    const { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, template } = req.body;
+    let { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, template, purchaseMode } = req.body;
+    const mode = purchaseMode || (canBuyMaxCharges ? 'max' : (canBuyCharges ? 'normal' : 'none'));
+    canBuyCharges    = (mode === 'normal' || mode === 'max');
+    canBuyMaxCharges = (mode === 'max');
     manager.name = templateName;
     manager.coords = coords;
     manager.userIds = userIds;

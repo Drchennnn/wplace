@@ -33,10 +33,170 @@ const px = $("px");
 const py = $("py");
 const userSelectList = $("userSelectList");
 const selectAllUsers = $("selectAllUsers");
+const BUILD = 'dbg1';
+console.log('[index.js] build =', BUILD);
 
-// === Enhanced user multi-select ===
-let __allUsersCache = [];
-let __lastCheckedIndex = null;
+// === Realtime (SSE) + UI helpers (Final) ===
+let __es = null;
+let __esRetry = 1000;
+
+// 兼容两种 charges 形态
+function getChargeCount(u){
+  return Number.isFinite(u?.charges) ? Math.floor(u.charges)
+       : Number.isFinite(u?.charges?.count) ? Math.floor(u.charges.count)
+       : null;
+}
+function getMaxCharges(u){
+  return Number.isFinite(u?.maxCharges) ? u.maxCharges
+       : Number.isFinite(u?.charges?.max) ? u.charges.max
+       : null;
+}
+function getLevel(u){
+  return Number.isFinite(u?.level) ? u.level
+       : Number.isFinite(u?.stats?.level) ? u.stats.level
+       : null;
+}
+function getDroplets(u){
+  return Number.isFinite(u?.droplets) ? u.droplets
+       : Number.isFinite(u?.wallet?.droplets) ? u.wallet.droplets
+       : null;
+}
+
+
+// 从前端卡片的文字解析用户数值：Charges/Droplets
+function parseUserStatsFromDOM(uid) {
+    const statsEl = document.querySelector(`.user-card[data-user-id="${uid}"] .stats`);
+    if (!statsEl) return { id: uid, cur: 0, max: 0, droplets: 0 };
+  
+    const text = statsEl.textContent || "";
+  
+    // Charges: cur / max
+    let cur = 0, max = 0;
+    const mCharges = text.match(/Charges:\s*(\d+)\s*\/\s*(\d+)/i);
+    if (mCharges) { cur = parseInt(mCharges[1], 10) || 0; max = parseInt(mCharges[2], 10) || 0; }
+  
+    // Droplets: n
+    let droplets = 0;
+    const mDrops = text.match(/Droplets:\s*(\d+)/i);
+    if (mDrops) droplets = parseInt(mDrops[1], 10) || 0;
+  
+    return { id: uid, cur, max, droplets };
+  }
+  
+/** 在卡片显示 Cookie 到期信息 */
+function renderCookieExpiry(card, jwtExpMs) {
+  let badge = card.querySelector('.cookie-exp');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'cookie-exp';
+    const info = card.querySelector('.user-info') || card;
+    info.appendChild(badge);
+  }
+  if (!jwtExpMs) {
+    badge.textContent = 'Cookie: 未知到期';
+    badge.style.color = '';
+    return;
+  }
+  const msLeft = Number(jwtExpMs) - Date.now();
+  if (msLeft <= 0) {
+    badge.textContent = 'Cookie: 已过期';
+    badge.style.color = '#ff4d4f';
+    return;
+  }
+  const days = Math.floor(msLeft / 86400000);
+  const hours = Math.floor((msLeft % 86400000) / 3600000);
+  badge.textContent = `Cookie: ~${days}天 ${hours}小时`;
+  badge.style.color = (msLeft <= 3*86400000) ? '#ff4d4f'
+                 : (msLeft <= 7*86400000) ? '#ffb020' : '';
+}
+
+/** 应用一次后端推送到某张用户卡 */
+function applyUserUpdate(u) {
+  if (!u || u.userId == null) return;
+  const card = document.getElementById(`user-${u.userId}`);
+  if (!card) return;
+
+  const count = getChargeCount(u);
+  const max   = getMaxCharges(u);
+  const lvl   = getLevel(u);
+  const drp   = getDroplets(u);
+
+  const stats = card.querySelectorAll('.user-stats b'); // charges / max / level / droplets
+  if (stats[0] && count != null) stats[0].textContent = count;
+  if (stats[1] && max   != null) stats[1].textContent = max;
+  if (stats[2] && lvl   != null) stats[2].textContent = Math.floor(lvl);
+  if (stats[3] && drp   != null) stats[3].textContent = drp;
+
+  const lp = card.querySelector('.level-progress');
+  if (lp && Number.isFinite(lvl)) {
+    lp.textContent = `(${Math.round((lvl % 1) * 100)}%)`;
+  }
+
+  // 封禁提示颜色
+  const suspended = !!u.recentlySuspended || (u.suspendedUntil && Date.now() < Number(u.suspendedUntil));
+  card.querySelectorAll('.user-info > span').forEach(span => {
+    span.style.color = suspended ? 'var(--warning-color)' : 'var(--success-color)';
+  });
+
+  // Cookie 到期
+  renderCookieExpiry(card, u.jwtExp);
+
+  // 微小动画
+  card.classList.add('pulse');
+  setTimeout(() => card.classList.remove('pulse'), 400);
+}
+
+/** 建立/重连 SSE */
+function attachUserRealtime() {
+  if (__es) return;
+  __es = new EventSource('/api/events');
+
+  __es.addEventListener('hello', () => { __esRetry = 1000; });
+  __es.addEventListener('user_update', (ev) => {
+    try { applyUserUpdate(JSON.parse(ev.data)); } catch {}
+  });
+
+  __es.onerror = () => {
+    try { __es.close(); } catch {}
+    __es = null;
+    setTimeout(attachUserRealtime, __esRetry);
+    __esRetry = Math.min(__esRetry * 1.8, 10000);
+  };
+
+  window.addEventListener('beforeunload', () => { try { __es?.close(); } catch {} });
+}
+
+/** 批量 Cookie 同步（配合 Tampermonkey） */
+async function openSyncWindow(userId, cbBase) {
+  const url = `https://wplace.live/?syncTo=${encodeURIComponent(userId)}&cb=${encodeURIComponent(cbBase)}`;
+  return window.open(url, '_blank', 'width=980,height=800');
+}
+function runBulkCookieSync(userIds) {
+  if (!userIds || !userIds.length) return;
+  const cbBase = location.origin;
+  let idx = 0;
+
+  const onMsg = (ev) => {
+    if (ev?.data?.type === 'wplacer-sync-done') {
+      idx++;
+      if (idx < userIds.length) {
+        setTimeout(() => openSyncWindow(userIds[idx], cbBase), 600);
+      } else {
+        window.removeEventListener('message', onMsg);
+        alert('✅ 本组同步完成');
+      }
+    }
+  };
+  window.addEventListener('message', onMsg);
+  openSyncWindow(userIds[0], cbBase);
+}
+
+/** 读取“已勾选”的用户 id（批量同步/分组用） */
+function getSelectedUserIds() {
+  return Array.from(document.querySelectorAll('.user-check:checked'))
+    .map(el => el.dataset.userId);
+}
+
 
 function __renderUserList(list) {
     const container = document.getElementById('userSelectList');
@@ -102,8 +262,9 @@ function __bindUserToolbar() {
     };
 }
 
-const canBuyMaxCharges = $("canBuyMaxCharges");
-const canBuyCharges = $("canBuyCharges");
+const pmNone   = $("pmNone");
+const pmNormal = $("pmNormal");
+const pmMax    = $("pmMax");
 const antiGriefMode = $("antiGriefMode");
 const enableAutostart = $("enableAutostart");
 const submitTemplate = $("submitTemplate");
@@ -467,17 +628,12 @@ document.addEventListener("paste", (e) => {
     }
 });
 
-canBuyMaxCharges.addEventListener('change', () => {
-    if (canBuyMaxCharges.checked) {
-        canBuyCharges.checked = false;
-    }
-});
-
-canBuyCharges.addEventListener('change', () => {
-    if (canBuyCharges.checked) {
-        canBuyMaxCharges.checked = false;
-    }
-});
+function getPurchaseMode() {
+    return document.querySelector('input[name="purchaseMode"]:checked')?.value || 'none';
+  }
+  function setPurchaseMode(mode) {
+    (document.querySelector(`input[name="purchaseMode"][value="${mode}"]`) || pmNone).checked = true;
+  }
 
 const resetTemplateForm = () => {
     templateForm.reset();
@@ -499,18 +655,21 @@ templateForm.addEventListener('submit', async (e) => {
         showMessage("Error", "Please convert an image before creating a template.");
         return;
     }
-    const selectedUsers = Array.from(document.querySelectorAll('input[name="user_checkbox"]:checked')).map(cb => cb.value);
+    const selectedUsers = Array.from(document.querySelectorAll('input[name="user_checkbox"]:checked')).map(cb => String(cb.value));
     if (selectedUsers.length === 0) {
         showMessage("Error", "Please select at least one user.");
         return;
     }
 
+    const purchaseMode = getPurchaseMode(); // 'none' | 'normal' | 'max'
+
     const data = {
         templateName: templateName.value,
         coords: [tx.value, ty.value, px.value, py.value].map(Number),
         userIds: selectedUsers,
-        canBuyCharges: canBuyCharges.checked,
-        canBuyMaxCharges: canBuyMaxCharges.checked,
+        purchaseMode,
+        canBuyCharges:    purchaseMode === 'normal',
+        canBuyMaxCharges: purchaseMode === 'max',
         antiGriefMode: antiGriefMode.checked,
         enableAutostart: enableAutostart.checked
     };
@@ -560,92 +719,295 @@ stopAll.addEventListener('click', async () => {
 // tabs
 let currentTab = main;
 const changeTab = (el) => {
-    if (templateUpdateInterval) {
-        clearInterval(templateUpdateInterval);
-        templateUpdateInterval = null;
-    }
-    currentTab.style.display = "none";
-    el.style.display = "block";
-    currentTab = el;
+  if (templateUpdateInterval) {
+    clearInterval(templateUpdateInterval);
+    templateUpdateInterval = null;
+  }
+  currentTab.style.display = "none";
+  el.style.display = "block";
+  currentTab = el;
 };
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 openManageUsers.addEventListener("click", () => {
-    userList.innerHTML = "";
-    userForm.reset();
-    totalCharges.textContent = "?";
-    totalMaxCharges.textContent = "?";
-    loadUsers(users => {
-        const userCount = Object.keys(users).length;
-        manageUsersTitle.textContent = `Existing Users (${userCount})`;
-        for (const id of Object.keys(users)) {
-            const user = document.createElement('div');
-            user.className = 'user';
-            user.id = `user-${id}`;
+  userList.innerHTML = "";
+  userForm.reset();
+  totalCharges.textContent = "?";
+  totalMaxCharges.textContent = "?";
 
-            user.innerHTML = `
-                <div class="user-info">
-                    <span>${users[id].name}</span>
-                    <span>(#${id})</span>
-                    <div class="user-stats">
-                        Charges: <b>?</b>/<b>?</b> | Level <b>?</b> <span class="level-progress">(?%)</span><br>
-                        Droplets: <b>?</b>
-                    </div>
-                </div>
-                <div class="user-actions">
-                    <button class="delete-btn" title="Delete User"><img src="icons/remove.svg"></button>
-                    <button class="info-btn" title="Get User Info"><img src="icons/code.svg"></button>
-                </div>`;
+  loadUsers(users => {
+    const userCount = Object.keys(users).length;
+    manageUsersTitle.textContent = `Existing Users (${userCount})`;
 
-            user.querySelector('.delete-btn').addEventListener("click", () => {
-                showConfirmation(
-                    "Delete User",
-                    `Are you sure you want to delete ${users[id].name} (#${id})? This will also remove them from all templates.`,
-                    async () => {
-                        try {
-                            await axios.delete(`/user/${id}`);
-                            showMessage("Success", "User deleted.");
-                            openManageUsers.click();
-                        } catch (error) {
-                            handleError(error);
-                        };
-                    }
-                );
-            });
-            user.querySelector('.info-btn').addEventListener("click", async () => {
-                try {
-                    const response = await axios.get(`/user/status/${id}`);
-                    const info = `
-                    <b>User Name:</b> <span style="color: #f97a1f;">${response.data.name}</span><br>
-                    <b>Charges:</b> <span style="color: #f97a1f;">${Math.floor(response.data.charges.count)}</span>/<span style="color: #f97a1f;">${response.data.charges.max}</span><br>
-                    <b>Droplets:</b> <span style="color: #f97a1f;">${response.data.droplets}</span><br>
-                    <b>Favorite Locations:</b> <span style="color: #f97a1f;">${response.data.favoriteLocations.length}</span>/<span style="color: #f97a1f;">${response.data.maxFavoriteLocations}</span><br>
-                    <b>Flag Equipped:</b> <span style="color: #f97a1f;">${response.data.equippedFlag ? "Yes" : "No"}</span><br>
-                    <b>Discord:</b> <span style="color: #f97a1f;">${response.data.discord}</span><br>
-                    <b>Country:</b> <span style="color: #f97a1f;">${response.data.country}</span><br>
-                    <b>Pixels Painted:</b> <span style="color: #f97a1f;">${response.data.pixelsPainted}</span><br>
-                    <b>Extra Colors:</b> <span style="color: #f97a1f;">${response.data.extraColorsBitmap}</span><br>
-                    <b>Alliance ID:</b> <span style="color: #f97a1f;">${response.data.allianceId}</span><br>
-                    <b>Alliance Role:</b> <span style="color: #f97a1f;">${response.data.allianceRole}</span><br>
-                    <br>Would you like to copy the <b>Raw Json</b> to your clipboard?
-                    `;
+    for (const id of Object.keys(users)) {
+      const user = document.createElement('div');
+      user.className = 'user';
+      user.id = `user-${id}`;
 
-                    showConfirmation("User Info", info, () => {
-                        navigator.clipboard.writeText(JSON.stringify(response.data, null, 2));
-                    });
-                } catch (error) {
-                    handleError(error);
-                };
-            });
-            userList.appendChild(user);
-        };
-    });
-    changeTab(manageUsers);
+      user.innerHTML = `
+        <div class="user-info">
+          <!-- 勾选框：用于“批量同步（已选）/设置分组” -->
+          <input type="checkbox" class="user-check" data-user-id="${id}" title="选择该用户" style="margin-right:6px;">
+
+          <!-- 用户名与ID -->
+          <span class="user-name">${users[id].name}</span>
+          <span class="user-id">(#${id})</span>
+
+          <!-- Cookie 到期显示（初始占位；SSE 到来后由 applyUserUpdate/renderCookieExpiry 覆盖） -->
+          <div class="cookie-exp" style="margin-top:4px; font-size:12px; opacity:.9;">Cookie: 未知到期</div>
+
+          <!-- 统计信息：SSE 到来后由 applyUserUpdate() 更新数字 -->
+          <div class="user-stats" style="margin-top:4px;">
+            Charges: <b>?</b>/<b>?</b> | Level <b>?</b> <span class="level-progress">(?%)</span><br>
+            Droplets: <b>?</b>
+          </div>
+        </div>
+
+        <div class="user-actions">
+          <button class="delete-btn" title="Delete User"><img src="icons/remove.svg"></button>
+          <button class="info-btn" title="Get User Info"><img src="icons/code.svg"></button>
+        </div>
+      `;
+
+      // 删号
+      user.querySelector('.delete-btn').addEventListener("click", () => {
+        showConfirmation(
+          "Delete User",
+          `Are you sure you want to delete ${users[id].name} (#${id})? This will also remove them from all templates.`,
+          async () => {
+            try {
+              await axios.delete(`/user/${id}`);
+              showMessage("Success", "User deleted.");
+              openManageUsers.click();
+            } catch (error) {
+              handleError(error);
+            }
+          }
+        );
+      });
+
+      // 查看详情
+      user.querySelector('.info-btn').addEventListener("click", async () => {
+        try {
+          const response = await axios.get(`/user/status/${id}`);
+          const info = `
+            <b>User Name:</b> <span style="color: #f97a1f;">${response.data.name}</span><br>
+            <b>Charges:</b> <span style="color: #f97a1f;">${Math.floor(response.data.charges.count)}</span>/<span style="color: #f97a1f;">${response.data.charges.max}</span><br>
+            <b>Droplets:</b> <span style="color: #f97a1f;">${response.data.droplets}</span><br>
+            <b>Favorite Locations:</b> <span style="color: #f97a1f;">${response.data.favoriteLocations.length}</span>/<span style="color: #f97a1f;">${response.data.maxFavoriteLocations}</span><br>
+            <b>Flag Equipped:</b> <span style="color: #f97a1f;">${response.data.equippedFlag ? "Yes" : "No"}</span><br>
+            <b>Discord:</b> <span style="color: #f97a1f;">${response.data.discord}</span><br>
+            <b>Country:</b> <span style="color: #f97a1f;">${response.data.country}</span><br>
+            <b>Pixels Painted:</b> <span style="color: #f97a1f;">${response.data.pixelsPainted}</span><br>
+            <b>Extra Colors:</b> <span style="color: #f97a1f;">${response.data.extraColorsBitmap}</span><br>
+            <b>Alliance ID:</b> <span style="color: #f97a1f;">${response.data.allianceId}</span><br>
+            <b>Alliance Role:</b> <span style="color: #f97a1f;">${response.data.allianceRole}</span><br>
+            <br>Would you like to copy the <b>Raw Json</b> to your clipboard?
+          `;
+          showConfirmation("User Info", info, () => {
+            navigator.clipboard.writeText(JSON.stringify(response.data, null, 2));
+          });
+        } catch (error) {
+          handleError(error);
+        }
+      });
+
+      userList.appendChild(user);
+    } // end for
+  }); // end loadUsers
+
+  // === 实时（SSE）
+  attachUserRealtime();
+
+  // === 绑定批量工具（只绑定一次）
+  bindBulkToolsOnce();
+
+  // 切换到 ManageUsers 页
+  changeTab(manageUsers);
 });
+
+
+// ================== 下面是本段用到的小工具（若全局已有相同函数可忽略） ==================
+
+
+// 只绑定一次，避免重复监听
+function bindBulkToolsOnce() {
+  if (window.__bulkToolsBound) return;
+  window.__bulkToolsBound = true;
+
+  const bulkSyncSelectedBtn = document.getElementById('bulkSyncSelectedBtn');
+  const bulkSyncGroupBtn    = document.getElementById('bulkSyncGroupBtn');
+  const assignGroupBtn      = document.getElementById('assignGroupBtn');
+  const groupSelect         = document.getElementById('groupSelect');
+
+  if (!bulkSyncSelectedBtn || !bulkSyncGroupBtn || !assignGroupBtn || !groupSelect) {
+    console.warn('[BulkTools] 控件未找到（检查 index.html 的 id 是否匹配）');
+    return;
+  }
+
+  function getSelectedUserIds() {
+    return Array.from(document.querySelectorAll('.user-check:checked'))
+      .map(el => el.dataset.userId);
+  }
+
+  async function refreshGroupSelect() {
+    try {
+      const users = await axios.get('/users').then(r => r.data);
+      const set = new Set();
+      Object.values(users).forEach(u => u?.group && set.add(u.group));
+      const cur = groupSelect.value || '';
+      groupSelect.innerHTML = `<option value="">— Group —</option>` +
+        Array.from(set).sort().map(g => `<option value="${g}">${g}</option>`).join('');
+      groupSelect.value = cur;
+    } catch (e) {
+      console.error('[BulkTools] 刷新分组失败：', e);
+    }
+  }
+
+  // 设置分组（选中）
+  assignGroupBtn.addEventListener('click', async () => {
+    const ids = getSelectedUserIds();
+    if (!ids.length) return alert('请先在卡片上勾选用户');
+    const group = prompt('输入分组名（如：mainA；留空清除分组）', '');
+    if (group === null) return;
+    try {
+      const res = await axios.post('/users/group-bulk', { ids, group: group.trim() || null });
+      if (!res.data?.ok) throw new Error('后端返回失败');
+      // 卡片上的分组标签（你如果有 .user-group 就更新它；没有可忽略）
+      ids.forEach(id => {
+        const card = document.getElementById(`user-${id}`);
+        const tag = card?.querySelector('.user-group');
+        if (tag) tag.textContent = group ? ` [${group}]` : '';
+      });
+      await refreshGroupSelect();
+      alert('分组已更新');
+    } catch (e) {
+      console.error('[BulkTools] 设置分组失败：', e);
+      alert('设置分组失败，请查看控制台日志');
+    }
+  });
+
+  // 批量同步（已选）
+  bulkSyncSelectedBtn.addEventListener('click', async () => {
+    const ids = getSelectedUserIds();
+    if (!ids.length) return alert('请先在卡片上勾选用户');
+    if (!confirm(`将依次同步 ${ids.length} 个账号的 Cookie。\n弹窗内请切换到指定小号，脚本会自动上传并关闭。`)) return;
+    runBulkCookieSync(ids);
+  });
+
+// 批量同步（分组） —— 走 fetch/axios 后端，无弹窗
+bulkSyncGroupBtn.addEventListener('click', async () => {
+    const g = groupSelect?.value || '';
+    if (!g) return alert('请先选择一个分组');
+    try {
+      const users = await axios.get('/users').then(r => r.data);
+      const ids = Object.entries(users).filter(([id, u]) => u.group === g).map(([id]) => id);
+      if (!ids.length) return alert('该分组下没有用户');
+      if (!confirm(`将为分组 [${g}] 的 ${ids.length} 个账号进行同步。\n（无需弹窗登录，小号由后端用保存的cookie/token执行）`)) return;
+  
+      // UI 状态
+      const old = bulkSyncGroupBtn.innerText;
+      bulkSyncGroupBtn.disabled = true;
+      bulkSyncGroupBtn.innerText = '分组同步中…';
+  
+      // ✅ 关键改动：直接调用你自己的后端 API（自行替换为你的真实路径）
+      const resp = await axios.post('/api/bulkSyncGroup', {
+        groupId: g,
+        userIds: ids
+      }, { withCredentials: true });
+  
+      console.log('[BulkTools] bulkSyncGroup result:', resp.data);
+      alert(`已提交分组同步：${resp.data.count ?? ids.length} 个账号`);
+    } catch (e) {
+      console.error('[BulkTools] 分组同步失败：', e);
+      alert(`分组同步失败：${e?.response?.data?.error || e.message}`);
+    } finally {
+      bulkSyncGroupBtn.disabled = false;
+      bulkSyncGroupBtn.innerText = '批量同步（分组）';
+    }
+  });
+  
+
+  refreshGroupSelect();
+  console.log('[BulkTools] 已绑定');
+}
+
+// 打开目标站点窗口（配合 Tampermonkey 等你切号后自动上报）
+function openSyncWindow(userId, cbBase) {
+    const url = `https://wplace.live/?syncTo=${encodeURIComponent(userId)}&cb=${encodeURIComponent(cbBase)}`;
+    return window.open(url, '_blank', 'width=980,height=800');
+  }
+  
+
+// 顺序跑一组
+function runBulkCookieSync(userIds) {
+  if (!userIds || !userIds.length) return;
+  const cbBase = location.origin;
+  let idx = 0;
+
+  function next() {
+    if (idx >= userIds.length) {
+      alert('✅ 本组同步完成');
+      window.removeEventListener('message', onMsg);
+      return;
+    }
+    openSyncWindow(userIds[idx], cbBase);
+  }
+
+  function onMsg(ev) {
+    if (ev?.data?.type === 'wplacer-sync-done') {
+      idx++;
+      setTimeout(next, 600); // 给站点/脚本一点缓冲
+    }
+  }
+
+  window.addEventListener('message', onMsg);
+  next();
+}
+
 
 checkUserStatus.addEventListener("click", async () => {
     checkUserStatus.disabled = true;
     checkUserStatus.innerHTML = "Checking...";
     const userElements = Array.from(document.querySelectorAll('.user'));
+        // === 批量同步：选中 / 分组 ===
+    const bulkSyncSelectedBtn = document.getElementById('bulkSyncSelectedBtn');
+    const bulkSyncGroupBtn = document.getElementById('bulkSyncGroupBtn');
+    const groupSelect = document.getElementById('groupSelect');
+
+    if (bulkSyncSelectedBtn) {
+    bulkSyncSelectedBtn.addEventListener('click', async () => {
+        const ids = getSelectedUserIds();
+        if (!ids.length) return alert('请先在卡片上勾选用户');
+        if (!confirm(`将依次同步 ${ids.length} 个账号的 Cookie。\n弹窗内请切换到指定小号，脚本会自动上传并关闭。`)) return;
+        runBulkCookieSync(ids);
+    });
+    }
+
+    if (bulkSyncGroupBtn) {
+    bulkSyncGroupBtn.addEventListener('click', async () => {
+        const g = groupSelect?.value || '';
+        if (!g) return alert('请先选择一个分组');
+        const users = await axios.get('/users').then(r=>r.data);
+        const ids = Object.entries(users).filter(([id,u]) => u.group === g).map(([id])=>id);
+        if (!ids.length) return alert('该分组下没有用户');
+        if (!confirm(`将为分组 [${g}] 的 ${ids.length} 个账号进行同步。\n请先在浏览器登录该分组的“主号”，再点击确定开始。`)) return;
+        runBulkCookieSync(ids);
+    });
+    }
+
+    // 初始化分组下拉（从后端已有 users 里收集）
+    async function refreshGroupSelect() {
+    const users = await axios.get('/users').then(r=>r.data).catch(()=>({}));
+    const set = new Set();
+    Object.values(users).forEach(u => u?.group && set.add(u.group));
+    if (!groupSelect) return;
+    const cur = groupSelect.value || '';
+    groupSelect.innerHTML = `<option value="">— Group —</option>` + Array.from(set).sort().map(g => `<option value="${g}">${g}</option>`).join('');
+    groupSelect.value = cur;
+    }
+    refreshGroupSelect();
 
     // Set all users to "checking" state
     userElements.forEach(userEl => {
@@ -760,41 +1122,72 @@ const createToggleButton = (template, id, buttonsContainer, progressBarText, cur
     return button;
 };
 
+// —— 可替换原函数：带 ETA —— //
+// —— 覆盖原函数：仅用 DOM 解析 + ETA —— //
 const updateTemplateStatus = async () => {
     try {
-        const { data: templates } = await axios.get("/templates");
-        for (const id in templates) {
-            const t = templates[id];
-            const templateElement = $(id);
-            if (!templateElement) continue;
-
-            const total = t.totalPixels || 1;
-            const remaining = t.pixelsRemaining !== null ? t.pixelsRemaining : total;
-            const completed = total - remaining;
-            const percent = Math.floor((completed / total) * 100);
-
-            const progressBar = templateElement.querySelector('.progress-bar');
-            const progressBarText = templateElement.querySelector('.progress-bar-text');
-            const pixelCount = templateElement.querySelector('.pixel-count');
-
-            if (progressBar) progressBar.style.width = `${percent}%`;
-            if (progressBarText) progressBarText.textContent = `${percent}% | ${t.status}`;
-            if (pixelCount) pixelCount.textContent = `${completed} / ${total}`;
-
-            if (t.status === "Finished.") {
-                progressBar.classList.add('finished');
-                progressBar.classList.remove('stopped');
-            } else if (!t.running) {
-                progressBar.classList.add('stopped');
-                progressBar.classList.remove('finished');
-            } else {
-                progressBar.classList.remove('stopped', 'finished');
-            }
+      const { data: templates } = await axios.get("/templates");
+  
+      for (const id in templates) {
+        const t = templates[id];
+        const templateElement = $(id);
+        if (!templateElement) continue;
+  
+        const total = t.totalPixels || 1;
+        const remaining = (t.pixelsRemaining != null ? t.pixelsRemaining : total);
+        const completed = Math.max(0, total - remaining);
+        const percent = Math.floor((completed / total) * 100);
+  
+        const progressBar     = templateElement.querySelector(".progress-bar");
+        const progressBarText = templateElement.querySelector(".progress-bar-text");
+        const pixelCount      = templateElement.querySelector(".pixel-count");
+  
+        if (progressBar)     progressBar.style.width = `${percent}%`;
+        if (progressBarText) progressBarText.textContent = `${percent}% | ${t.status}`;
+        if (pixelCount)      pixelCount.textContent = `${completed} / ${total}`;
+  
+        if (progressBar) {
+          if (t.status === "Finished.") {
+            progressBar.classList.add("finished");
+            progressBar.classList.remove("stopped");
+          } else if (!t.running) {
+            progressBar.classList.add("stopped");
+            progressBar.classList.remove("finished");
+          } else {
+            progressBar.classList.remove("stopped", "finished");
+          }
         }
+  
+        // —— 新增：从 DOM 解析账号数值，计算 ETA —— //
+        // 若后端提供 t.userIds 就用它；否则退化为“页面上所有 .user-card”
+        const userIds = Array.isArray(t.userIds) && t.userIds.length
+          ? t.userIds
+          : Array.from(document.querySelectorAll(".user-card"))
+              .map(el => el.getAttribute("data-user-id"))
+              .filter(Boolean);
+  
+        const accounts = userIds.map(uid => parseUserStatsFromDOM(uid));
+  
+        if (window.ProgressETA) {
+          window.ProgressETA.update(
+            templateElement,
+            accounts,
+            completed,
+            total,
+            {
+              rechargePerSec: 1 / 30,  // 每号 120 点/小时
+              boostPerBuy: 30,
+              boostCostDroplets: 1,
+              spendAllDroplets: true
+            }
+          );
+        }
+      }
     } catch (error) {
-        console.error("Failed to update template statuses:", error);
+      console.error("Failed to update template statuses:", error);
     }
-};
+  };
+  
 
 openManageTemplates.addEventListener("click", () => {
     templateList.innerHTML = "";
@@ -863,15 +1256,20 @@ openManageTemplates.addEventListener("click", () => {
 
                     templateName.value = t.name;
                     [tx.value, ty.value, px.value, py.value] = t.coords;
-                    canBuyCharges.checked = t.canBuyCharges;
-                    canBuyMaxCharges.checked = t.canBuyMaxCharges;
+                    // ✅ 新：用单选枚举回填（优先用 t.purchaseMode，兼容老字段）
+                    const mode = t.purchaseMode
+                    ? t.purchaseMode                                  // 'none' | 'normal' | 'max'
+                    : (t.canBuyMaxCharges ? 'max'
+                        : (t.canBuyCharges ? 'normal' : 'none'));
+                    setPurchaseMode(mode);                              // ← 你已实现的工具函数
+
                     antiGriefMode.checked = t.antiGriefMode;
                     enableAutostart.checked = t.enableAutostart;
 
                     // Wait for DOM to update, then check appropriate users
                     setTimeout(() => {
                         document.querySelectorAll('input[name="user_checkbox"]').forEach(cb => {
-                            cb.checked = t.userIds.includes(cb.value);
+                            cb.checked = t.userIds.map(String).includes(cb.value);
                         });
                     }, 100);
                 });

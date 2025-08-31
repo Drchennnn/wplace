@@ -67,7 +67,7 @@ proxies:
   - { name: 日本-FW-JP5, type: trojan, server: fw-jp5.rise-fuji.com, port: 5015, password: iYYNaaloqEpUl2rDAW, alpn: ["h2","http/1.1"], skip-cert-verify: true }
 
 # 三个代理组
-proxy-groups:
+roxy-groups:
   - name: GroupA
     type: url-test
     url: https://cp.cloudflare.com/generate_204

@@ -7,6 +7,7 @@
     <link rel="icon" type="image/x-icon" href="icons/favicon.png">
     <link rel="stylesheet" href="styles/index.css">
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script defer src="scripts/index.js?v=dbg1"></script>
     <title>wplacer</title>
 </head>
 
@@ -39,6 +40,23 @@
                 <b>Total Max Charges:</b> <span id="totalMaxCharges">?</span>
             </div>
             <button id="checkUserStatus" class="primary-button"><img src="icons/check.svg">Check Account Status</button>
+            <!-- 新增的工具栏按钮/控件 -->
+            <button id="bulkSyncSelectedBtn" class="primary-button">
+                <img src="icons/sync.svg">批量同步（已选）
+            </button>
+            
+            <select id="groupSelect" class="secondary-select" title="Group filter">
+                <option value="">— Group —</option>
+            </select>
+            
+            <button id="bulkSyncGroupBtn" class="primary-button">
+                <img src="icons/sync.svg">批量同步（分组）
+            </button>
+            
+            <button id="assignGroupBtn" class="secondary-button">
+                <img src="icons/tag.svg">将所选设置为组
+            </button>
+            
             <div id="userList"></div>
 
             <button onclick="changeTab(main);" class="secondary-button"><img src="icons/return.svg">Return</button>
@@ -84,20 +102,25 @@
                 <div id="userSelectList"></div>
                 <button type="button" id="selectAllUsers" class="secondary-button"><img src="icons/manageUsers.svg">Select All</button>
 
-                <div class="setting-toggle">
-                    <label for="canBuyMaxCharges">Buy max charge upgrades</label>
-                    <label class="switch">
-                        <input id="canBuyMaxCharges" name="canBuyMaxCharges" type="checkbox">
-                        <span class="slider"></span>
-                    </label>
+                <div class="setting-group">
+                   <label style="display:block;margin-bottom:6px;">Buy charges mode</label>
+                   <div id="purchaseModeFieldset" role="radiogroup" aria-label="Buy charges mode"
+                        class="radio-row">
+                     <label style="margin-right:14px;">
+                       <input type="radio" name="purchaseMode" id="pmNone"   value="none"   checked>
+                       Do not buy
+                     </label>
+                     <label style="margin-right:14px;">
+                       <input type="radio" name="purchaseMode" id="pmNormal" value="normal">
+                       Buy charges (+5)
+                     </label>
+                     <label>
+                       <input type="radio" name="purchaseMode" id="pmMax"    value="max">
+                       Buy max upgrades (+30)
+                     </label>
+                   </div>
                 </div>
-                <div class="setting-toggle">
-                    <label for="canBuyCharges">Buy paint charges when running out</label>
-                    <label class="switch">
-                        <input id="canBuyCharges" name="canBuyCharges" type="checkbox">
-                        <span class="slider"></span>
-                    </label>
-                </div>
+                
                 <div class="setting-toggle">
                     <label for="antiGriefMode">Enable Anti Grief mode</label>
                     <label class="switch">
@@ -233,6 +256,97 @@
     </div>
 
     <script type="text/javascript" src="scripts/index.js"></script>
+    
+    <script type="text/javascript" src="scripts/progress-eta.js"></script>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+          const btnGroup    = document.getElementById("bulkSyncGroupBtn");
+          const selectGroup = document.getElementById("groupSelect");
+        
+          btnGroup.addEventListener("click", async () => {
+            console.log("[handler] bulkSyncGroupBtn clicked", Date.now());
+        
+            // 1) 取分组ID + 该组内账号（示例选择器，按你的实际结构改）
+            const groupId = selectGroup?.value || "";
+            if (!groupId) {
+              alert("请先在下拉框选择一个分组。");
+              return;
+            }
+        
+            // 假设每个卡片有 data-user-id 和 data-group-id
+            const groupUsers = Array.from(document.querySelectorAll(".user-card"))
+              .filter(card => card.getAttribute("data-group-id") === groupId)
+              .map(card => card.getAttribute("data-user-id"))
+              .filter(Boolean);
+        
+            console.log("[bulkSyncGroup] groupId:", groupId, "users:", groupUsers);
+        
+            if (groupUsers.length === 0) {
+              alert("这个分组里没有账号可同步。");
+              return;
+            }
+        
+            if (!confirm(`将以你当前已登录的主号状态，依次为该分组 ${groupUsers.length} 个账号执行同步。继续？`)) {
+              return;
+            }
+        
+            // 2) 立刻开一个测试弹窗，检查是否被拦截（必须在用户手势栈内）
+            const testWin = window.open("", "_blank", "noopener,noreferrer,width=800,height=700");
+            if (!testWin || testWin.closed) {
+              alert("浏览器拦截了弹窗：请在地址栏右侧将本站的弹窗设置为“允许”，再试一次。");
+              return;
+            }
+            testWin.document.write("<p style='font-family:sans-serif'>准备同步…</p>");
+            testWin.document.close();
+        
+            // 3) UI 状态
+            const originalText = btnGroup.innerText;
+            btnGroup.disabled = true;
+            btnGroup.innerText = "分组同步中…";
+        
+            try {
+              // 4) 为每个账号预开窗口（保证不被拦），随后异步设置URL
+              const popupWins = groupUsers.map(() => {
+                const w = window.open("", "_blank", "noopener,noreferrer,width=800,height=700");
+                return w;
+              });
+        
+              // 若任何一个被拦截，提示一次
+              if (popupWins.some(w => !w || w.closed)) {
+                alert("有弹窗被拦截：请允许弹窗后重试。");
+                popupWins.forEach(w => { try { w && w.close(); } catch(e){} });
+                return;
+              }
+        
+              // 5) 这里构建每个账号的同步URL —— 用你可用的后端替换
+              //    ✅ 推荐改成你本机： http://127.0.0.1:3000/sync?to=<uid>&cb=<回调>
+              //    ⚠️ 不要再用 backend.wplace.live（之前404）
+              const backend = "http://127.0.0.1:3000";
+              const cb      = location.origin; // 或你想回调的地址
+        
+              groupUsers.forEach((uid, i) => {
+                const url = `${backend}/sync?to=${encodeURIComponent(uid)}&cb=${encodeURIComponent(cb)}`;
+                console.log("[bulkSyncGroup] open:", url);
+                // 立即把空白页导航到目标URL
+                popupWins[i].location.replace(url);
+              });
+        
+              alert(`已为分组中的 ${groupUsers.length} 个账号发起同步窗口。若无自动跳转，请检查后端 /sync 路由是否存在。`);
+            } catch (err) {
+              console.error(err);
+              alert(`分组同步失败：${err.message || err}`);
+            } finally {
+              btnGroup.disabled = false;
+              btnGroup.innerText = originalText;
+              try { testWin && !testWin.closed && testWin.close(); } catch(e){}
+            }
+          });
+        });
+        </script>
+        
+        
+
 </body>
 
 </html>
