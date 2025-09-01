@@ -41,6 +41,45 @@ const duration = (durationMs) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 统一把购买模式标准化：优先用枚举，其次兼容老的两个布尔
+function normalizePurchaseMode(body = {}) {
+    const RAW = String(body.purchaseMode || '').trim();
+    const valid = ['none', 'normal', 'max'];
+    const mode = valid.includes(RAW)
+      ? RAW
+      : (body.canBuyMaxCharges ? 'max'
+         : (body.canBuyCharges ? 'normal' : 'none'));
+  
+    return {
+      purchaseMode: mode,                          // 'none' | 'normal' | 'max'
+      canBuyCharges: (mode === 'normal' || mode === 'max'),
+      canBuyMaxCharges: (mode === 'max'),
+    };
+  }
+  
+// —— 统一常量（按你站点实际值来；若已有常量就复用已有的）——
+const UNIT_PIXELS_PER_PACK = 30;   // 每包增加的像素数
+const UNIT_DROPLET_COST    = 500;  // 每包消耗的 droplets
+
+// 计算“可用于购买”的 droplets：当前滴滴 - 预留值（最低为 0）
+function affordableDropletsOf(userInfo, reserve = currentSettings.dropletReserve) {
+  const d = Number(userInfo?.droplets) || 0;
+  const r = Number(reserve) || 0;
+  return Math.max(0, d - r);
+}
+
+// 计算应该买几包：受剩余像素、钱包、上限共同约束
+function calcPacksToBuy(pixelsRemaining, userInfo, opts = {}) {
+  const { reserve = currentSettings.dropletReserve,
+          maxPacks = (currentSettings.maxPacksPerTurn ?? 3) } = opts;
+
+  const afford = affordableDropletsOf(userInfo, reserve);
+  const packsByNeed  = Math.ceil(Math.max(0, pixelsRemaining) / UNIT_PIXELS_PER_PACK);
+  const packsByMoney = Math.floor(afford / UNIT_DROPLET_COST);
+  return Math.max(0, Math.min(packsByNeed, packsByMoney, maxPacks));
+}
+
+
 // === JWT 过期时间解析 ===
 function readJwtExp(jwt) {
     if (!jwt || typeof jwt !== 'string' || !jwt.includes('.')) return null;
@@ -54,7 +93,6 @@ function readJwtExp(jwt) {
     return user?.cookies?.j || null;
   }
   
-  // --- Express App Setup ---
   // --- Express App Setup ---
 const app = express();
 app.use(cors());
@@ -651,44 +689,88 @@ let activePaintingTasks = 0;
 
 // --- Template Management ---
 class TemplateManager {
-    constructor(name, templateData, coords, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, userIds) {
-        this.name = name;
-        this.template = templateData;
-        this.coords = coords;
-        this.canBuyCharges = canBuyCharges;
-        this.canBuyMaxCharges = canBuyMaxCharges;
-        this.antiGriefMode = antiGriefMode;
-        this.enableAutostart = enableAutostart;
-        this.userIds = userIds;
-        this.running = false;
-        this.status = "Waiting to be started.";
-        this.masterId = this.userIds[0];
-        this.masterName = users[this.masterId]?.name || 'Unknown';
-        this.sleepAbortController = null;
-        this.totalPixels = this.template.data.flat().filter(p => p != 0).length;
-        this.pixelsRemaining = this.totalPixels;
-        this.currentPixelSkip = currentSettings.pixelSkip;
-
-        // Exponential backoff state
-        this.initialRetryDelay = 30 * 1000; // 30 seconds
-        this.maxRetryDelay = 5 * 60 * 1000; // 5 minutes
-        this.currentRetryDelay = this.initialRetryDelay;
-        this.recentlySuspended = new Map(); // id -> ts
-
-        // 统一“买电模式”：'none' | 'normal' | 'max'
-        // 兼容：前端可能只发老字段 canBuyCharges / canBuyMaxCharges
-        this.purchaseMode = (typeof this.purchaseMode === 'string') ? this.purchaseMode
-        : (this.canBuyMaxCharges ? 'max' : (this.canBuyCharges ? 'normal' : 'none'));
-
-        // 向下兼容：老代码里大量用到这俩布尔
-        this.canBuyCharges    = (this.purchaseMode === 'normal' || this.purchaseMode === 'max');
-        this.canBuyMaxCharges = (this.purchaseMode === 'max');
-
-        // 可选：启动时打一条日志自检
-        log('SYSTEM', 'wplacer', `[${this.name}] PurchaseMode=${this.purchaseMode} canBuyCharges=${this.canBuyCharges} canBuyMaxCharges=${this.canBuyMaxCharges}`);
-
+    constructor(
+      name,
+      templateData,
+      coords,
+      canBuyCharges,
+      canBuyMaxCharges,
+      antiGriefMode,
+      enableAutostart,
+      userIds,
+      purchaseMode     // ← 如果调用方会传，就接住；否则下面也会从 templateData/布尔推断
+    ) {
+      this.name = name;
+      this.template = templateData;
+      this.coords = coords;
+  
+      // 这些布尔先别急着定最终值，下面会统一由 purchaseMode 推导再覆盖
+      this.canBuyCharges = !!canBuyCharges;
+      this.canBuyMaxCharges = !!canBuyMaxCharges;
+  
+      this.antiGriefMode = !!antiGriefMode;
+      this.enableAutostart = !!enableAutostart;
+  
+      this.userIds = userIds || [];
+      this.running = false;
+      this.status = "Waiting to be started.";
+      this.masterId = this.userIds[0];
+      this.masterName = (users[this.masterId] && users[this.masterId].name) || 'Unknown';
+  
+      this.sleepAbortController = null;
+      this.totalPixels = (this.template?.data || []).flat().filter(p => p !== 0).length;
+      this.pixelsRemaining = this.totalPixels;
+      this.currentPixelSkip = currentSettings.pixelSkip;
+  
+      // backoff
+      this.initialRetryDelay = 30 * 1000;
+      this.maxRetryDelay = 5 * 60 * 1000;
+      this.currentRetryDelay = this.initialRetryDelay;
+  
+      // 运行期封禁记录
+      this.recentlySuspended = new Map();
+        
+      // —— 统一“买电模式”：优先用入参；否则尝试从模板；否则兼容老布尔 —— //
+      const mode =
+        (typeof purchaseMode === 'string' && purchaseMode) ||
+        (this.template && this.template.purchaseMode) ||
+        (this.canBuyMaxCharges ? 'max' : (this.canBuyCharges ? 'normal' : 'none'));
+  
+      this.purchaseMode = mode;                            // 'none' | 'normal' | 'max'
+      this.canBuyCharges    = (mode === 'normal' || mode === 'max'); // 统一布尔（兼容旧代码）
+      this.canBuyMaxCharges = (mode === 'max');
+  
+      log('SYSTEM', 'wplacer',
+        `[${this.name}] PurchaseMode=${this.purchaseMode} canBuyCharges=${this.canBuyCharges} canBuyMaxCharges=${this.canBuyMaxCharges}`);
+    }
+  
+    // ========= 放在 constructor 之外！以下是“类方法” =========
+    _makePlacer() {
+        return new WPlacer(this.template, this.coords, currentSettings, this.name);
+      }
+    // 账号被封到何时（持久封禁/近期封禁取较大者）
+    _blockedUntil(uid) {
+      const u = users[uid] || {};
+      const persisted = Number(u.suspendedUntil) || 0; // 持久封禁
+      const recent = Number((this.recentlySuspended && this.recentlySuspended.get(uid)) || 0); // 近期封禁
+      return Math.max(persisted, recent);
+    }
+  
+    // 是否可用：未在执行 + 未处于封禁期
+    _isUserAvailable(uid) {
+      if (!uid) return false;
+      if (activeBrowserUsers.has(uid)) return false; // 并发锁
+      const blockedUntil = this._blockedUntil(uid);
+      return !(blockedUntil && Date.now() < blockedUntil);
+    }
+  
+    // 过滤出可用账号
+    _filterAvailable(ids) {
+      return (ids || []).filter((id) => this._isUserAvailable(id));
     }
 
+    
+    
     sleep(ms) {
         return new Promise((resolve) => {
             if (this.sleepAbortController) {
@@ -720,7 +802,7 @@ class TemplateManager {
     async handleUpgrades(wplacer) {
         if (!this.canBuyMaxCharges) return;
         await wplacer.loadUserInfo();
-        const affordableDroplets = wplacer.userInfo.droplets - currentSettings.dropletReserve;
+        const affordableDroplets = affordableDropletsOf(wplacer.userInfo);
         const amountToBuy = Math.floor(affordableDroplets / 500);
         if (amountToBuy > 0) {
             log(wplacer.userInfo.id, wplacer.userInfo.name, `💰 Attempting to buy ${amountToBuy} max charge upgrade(s).`);
@@ -744,29 +826,25 @@ class TemplateManager {
       
         try {
             for (const uid of candidates) {
-                  if (!uid || activeBrowserUsers.has(uid)) continue;
                   activeBrowserUsers.add(uid);
-                  const w = new WPlacer(this.template, this.coords, currentSettings, this.name);
+                  const w = this._makePlacer();  
                   try {
                     const info = await w.login(users[uid].cookies);
                     buyerId = uid; buyerInfo = info; buyer = w; break;
-                    } catch {
+                    } catch (e) {
                     activeBrowserUsers.delete(uid);
                   }
                 }
                 if (!buyer) { log('SYSTEM','wplacer',`[${this.name}] 🔸 Skip buy: no free buyer (current/master busy).`); return false; }
                 if (buyerInfo) broadcastUserUpdate(buyerInfo);
       
-                const affordableDroplets = Math.max(0, (buyerInfo.droplets || 0) - currentSettings.dropletReserve);
+                const affordableDroplets = affordableDropletsOf(buyerInfo);
                 if (affordableDroplets < 500) { 
                    log(buyerId, users[buyerId].name, `[${this.name}] 🔸 Skip buy: droplets ${buyerInfo.droplets} < reserve+500.`);
                    return false; 
                 }
       
-          const amountToBuy = Math.min(
-            Math.ceil(this.pixelsRemaining / 30),
-            Math.floor(affordableDroplets / 500)
-          );
+            const amountToBuy = calcPacksToBuy(this.pixelsRemaining, buyerInfo);
           if (amountToBuy <= 0) { 
               log(buyerId, users[buyerId].name, `[${this.name}] 🔸 Skip buy: amountToBuy=0 (need/money不足).`);
               return false; 
@@ -823,7 +901,7 @@ class TemplateManager {
         if (activeBrowserUsers.has(userToRun.userId)) return;
         if (userToRun) {
             activeBrowserUsers.add(userToRun.userId);
-            const wplacer = new WPlacer(this.template, this.coords, currentSettings, this.name);
+            const wplacer = this._makePlacer();  
             let paintedInTurn = false;
             try {
                 const userInfo = await wplacer.login(users[userToRun.userId].cookies);
@@ -860,30 +938,9 @@ class TemplateManager {
                 await this.sleep(currentSettings.accountCooldown);
             }
 
-        } else {
-            if (this.canBuyCharges && !activeBrowserUsers.has(this.masterId)) {
-                activeBrowserUsers.add(this.masterId);
-                const chargeBuyer = new WPlacer(this.template, this.coords, currentSettings, this.name);
-                try {
-                    await chargeBuyer.login(users[this.masterId].cookies);
-                    const affordableDroplets = chargeBuyer.userInfo.droplets - currentSettings.dropletReserve;
-                    if (affordableDroplets >= 500) {
-                        const amountToBuy = Math.min(Math.ceil(this.pixelsRemaining / 30), Math.floor(affordableDroplets / 500));
-                        if (amountToBuy > 0) {
-                            log(this.masterId, this.masterName, `[${this.name}] 💰 Attempting to buy pixel charges...`);
-                            await chargeBuyer.buyProduct(80, amountToBuy);
-                            await this.sleep(currentSettings.purchaseCooldown);
-                            return true; // Indicate that a purchase was made
-                        }
-                    }
-                } catch (error) {
-                    logUserError(error, this.masterId, this.masterName, "attempt to buy pixel charges");
-                } finally {
-                    activeBrowserUsers.delete(this.masterId);
-                }
-            }
-        }
-
+        }  else {
+    await this._maybeBuyChargesAfterTurn(null);
+    }
         return false; //No purchase was made
     }
 
@@ -910,7 +967,7 @@ class TemplateManager {
                         }
 
                         for (const userId of availableCheckUsers) {
-                            const checkWplacer = new WPlacer(this.template, this.coords, currentSettings, this.name);
+                            const checkWplacer = this._makePlacer();  
                             try {
                                 const userInfo = await checkWplacer.login(users[userId].cookies);
                                 if (userInfo) broadcastUserUpdate(userInfo);
@@ -940,14 +997,7 @@ class TemplateManager {
                         const now = Date.now();
                         
                         // 统一按“封禁到期 + 冷静期”跳过（包含持久化的 suspendedUntil 与进程内 recentlySuspended）
-                        const availableUsers = this.userIds.filter(id => {
-                          const u = users[id] || {};
-                          const persisted = Number(u.suspendedUntil) || 0;              // 持久化记录（我们在捕获 SuspensionError 时写入，含冷静期）
-                          const recent    = Number(this.recentlySuspended.get(id)) || 0; // 进程内最近一次记录（防止未持久化也能生效）
-                          const blockedUntil = Math.max(persisted, recent);
-                          const blocked = blockedUntil && now < blockedUntil;
-                          return !blocked && !activeBrowserUsers.has(id);
-                        });
+                        const availableUsers = this._filterAvailable(this.userIds);
                         
                         // 日志里把被跳过的数量也打出来，便于观测是否生效
                         const skippedCount = this.userIds.length - availableUsers.length;
@@ -956,7 +1006,7 @@ class TemplateManager {
                         for (const userId of availableUsers) {
                           if (activeBrowserUsers.has(userId)) continue;
                           activeBrowserUsers.add(userId);
-                          const wplacer = new WPlacer();
+                          const wplacer = this._makePlacer();  
                           try {
                             const userInfo = await wplacer.login(users[userId].cookies);
                             broadcastUserUpdate(userInfo);
@@ -1031,7 +1081,7 @@ app.post("/t", (req, res) => {
 app.get("/users", (_, res) => res.json(users));
 app.post("/user", async (req, res) => {
     if (!req.body.cookies || !req.body.cookies.j) return res.sendStatus(400);
-    const wplacer = new WPlacer();
+    const wplacer = new WPlacer(null, null, currentSettings, "temp");  // Fixed
     try {
         const userInfo = await wplacer.login(req.body.cookies);
         users[userInfo.id] = { name: userInfo.name, cookies: req.body.cookies, expirationDate: req.body.expirationDate };
@@ -1080,7 +1130,7 @@ app.get("/user/status/:id", async (req, res) => {
     const { id } = req.params;
     if (!users[id] || activeBrowserUsers.has(id)) return res.sendStatus(409);
     activeBrowserUsers.add(id);
-    const wplacer = new WPlacer();
+    const wplacer = new WPlacer(null, null, currentSettings, "temp");  // Fixed
     try {
         const userInfo = await wplacer.login(users[id].cookies);
         broadcastUserUpdate(userInfo);
@@ -1099,7 +1149,7 @@ app.post("/user/:id/cookies", async (req, res) => {
     const { cookies, expirationDate } = req.body || {};
     if (!users[id] || !cookies?.j) return res.sendStatus(400);
   
-    const w = new WPlacer();
+    const w = new WPlacer(null, null, currentSettings, "temp");  // Fixed
     try {
       const info = await w.login(cookies);         // 用新 cookie 校验
       users[id].cookies = cookies;                 // 保存
@@ -1128,7 +1178,7 @@ app.post("/user/:id/cookies", async (req, res) => {
     for (const item of list) {
       const { id, cookies, expirationDate } = item || {};
       if (!id || !users[id] || !cookies?.j) { results.push({ id, ok:false, error:'bad_entry' }); continue; }
-      const w = new WPlacer();
+      const w = new WPlacer(null, null, currentSettings, "temp");  // Fixed
       try {
         const info = await w.login(cookies);
         users[id].cookies = cookies;
@@ -1158,7 +1208,7 @@ app.post("/users/status", async (req, res) => {
             return;
         }
         activeBrowserUsers.add(id);
-        const wplacer = new WPlacer();
+        const wplacer = new WPlacer(null, null, currentSettings, "temp");  // Fixed 
         try {
             const userInfo = await wplacer.login(users[id].cookies);
             broadcastUserUpdate(userInfo);
@@ -1254,19 +1304,36 @@ app.get("/templates", (_, res) => {
 });
 
 app.post("/template", async (req, res) => {
-    let { templateName, template, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, purchaseMode } = req.body;
-    const mode = purchaseMode || (canBuyMaxCharges ? 'max' : (canBuyCharges ? 'normal' : 'none'));
-    canBuyCharges    = (mode === 'normal' || mode === 'max');
-    canBuyMaxCharges = (mode === 'max');
-    if (!templateName || !template || !coords || !userIds || !userIds.length) return res.sendStatus(400);
-    if (Object.values(templates).some(t => t.name === templateName)) {
-        return res.status(409).json({ error: "A template with this name already exists." });
+    const { templateName, template, coords, userIds, antiGriefMode, enableAutostart } = req.body;
+    if (!templateName || !template || !Array.isArray(coords) || coords.length !== 4 || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.sendStatus(400);
     }
+  
+    // 统一模式：返回 { purchaseMode, canBuyCharges, canBuyMaxCharges }
+    const { purchaseMode, canBuyCharges, canBuyMaxCharges } = normalizePurchaseMode(req.body);
+  
+    // 唯一名校验
+    if (Object.values(templates).some(t => t.name === templateName)) {
+      return res.status(409).json({ error: "A template with this name already exists." });
+    }
+  
     const templateId = Date.now().toString();
-    templates[templateId] = new TemplateManager(templateName, template, coords, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, userIds);
+    templates[templateId] = new TemplateManager(
+      templateName,
+      template,
+      coords.map(Number),        // 统一成 number
+      canBuyCharges,
+      canBuyMaxCharges,
+      !!antiGriefMode,
+      !!enableAutostart,
+      userIds.map(String),       // 统一成 string
+      purchaseMode               // ★ 传入枚举
+    );
+  
     saveTemplates();
-    res.status(200).json({ id: templateId });
-});
+    res.status(201).json({ id: templateId });
+  });
+  
 
 app.delete("/template/:id", async (req, res) => {
     const { id } = req.params;
@@ -1280,7 +1347,8 @@ app.put("/template/edit/:id", async (req, res) => {
     const { id } = req.params;
     if (!templates[id]) return res.sendStatus(404);
     const manager = templates[id];
-    let { templateName, coords, userIds, canBuyCharges, canBuyMaxCharges, antiGriefMode, enableAutostart, template, purchaseMode } = req.body;
+    const { templateName, coords, userIds, antiGriefMode, enableAutostart, template } = req.body;
+    const { purchaseMode, canBuyCharges, canBuyMaxCharges } = normalizePurchaseMode(req.body);
     const mode = purchaseMode || (canBuyMaxCharges ? 'max' : (canBuyCharges ? 'normal' : 'none'));
     canBuyCharges    = (mode === 'normal' || mode === 'max');
     canBuyMaxCharges = (mode === 'max');
@@ -1291,6 +1359,9 @@ app.put("/template/edit/:id", async (req, res) => {
     manager.canBuyMaxCharges = canBuyMaxCharges;
     manager.antiGriefMode = antiGriefMode;
     manager.enableAutostart = enableAutostart;
+    manager.purchaseMode    = purchaseMode;
+    manager.canBuyCharges   = canBuyCharges;
+    manager.canBuyMaxCharges= canBuyMaxCharges;
 
     if (template) {
         manager.template = template;
